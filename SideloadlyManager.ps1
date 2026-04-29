@@ -281,7 +281,7 @@ if ($alreadyDead) {
 if ($expiringSoon) {
     # Cooldown: don't spam the same alert every 5 minutes
     $cooldownOk = $true
-    if (-not $TestExpireDays -ge 0 -and (Test-Path $AlertFlagFile)) {
+    if (-not ($TestExpireDays -ge 0) -and (Test-Path $AlertFlagFile)) {
         $lastAlert = [datetime]::Parse((Get-Content $AlertFlagFile))
         $hoursSince = ([datetime]::Now - $lastAlert).TotalHours
         if ($hoursSince -lt $AlertCooldown) {
@@ -314,26 +314,36 @@ $phoneHere     = Test-AppleDeviceConnected
 
 Write-Log "--- STATE: daemon=$daemonRunning  ourFlag=$weManagedIt  phone=$phoneHere ---"
 
-# ── CASE 1: phone arrived, daemon is off → start everything
+# ── CASE 1: phone arrived, daemon is off → start if any app needs refresh
 if ($phoneHere -and -not $daemonRunning) {
-    Write-Log "CASE 1: phone connected + daemon off → starting up" "OK"
+    # Only spin up when at least one app is ≤3 days from expiry (or already expired).
+    # The daemon's auto-refresh fires at refresh_at_hours (96 h = 4 d); 3 d gives a
+    # one-day buffer. No point running the daemon if nothing is due for renewal.
+    $needsRefresh = @($apps | Where-Object { $_.DaysLeft -le 3 })
 
-    $started = [System.Collections.Generic.List[string]]::new()
-    foreach ($entry in $AppleHelpers.GetEnumerator()) {
-        if (Start-AppleHelper -Name $entry.Key -Path $entry.Value) {
-            $started.Add($entry.Key)
+    if ($needsRefresh) {
+        $refreshList = ($needsRefresh | ForEach-Object { "$($_.Name) ($($_.DaysLeft)d)" }) -join ", "
+        Write-Log "CASE 1: phone connected + daemon off + apps need refresh ($refreshList) → starting up" "OK"
+
+        $started = [System.Collections.Generic.List[string]]::new()
+        foreach ($entry in $AppleHelpers.GetEnumerator()) {
+            if (Start-AppleHelper -Name $entry.Key -Path $entry.Value) {
+                $started.Add($entry.Key)
+            }
         }
+
+        Start-Process $DaemonPath -WindowStyle Hidden
+        Write-Log "Daemon process launched" "OK"
+
+        @{ StartedAt = [datetime]::Now.ToString('o'); StartedHelpers = ($started -join ',') } |
+            ConvertTo-Json | Set-Content $FlagFile
+        Write-Log "Flag written: $FlagFile"
+
+        $note = if ($started.Count) { " + $($started -join ', ')" } else { "" }
+        Send-Toast "Sideloadly" "Refreshing $refreshList$note"
+    } else {
+        Write-Log "CASE 1: phone connected + daemon off but no apps due for refresh (all expire >3d) - idle"
     }
-
-    Start-Process $DaemonPath -WindowStyle Hidden
-    Write-Log "Daemon process launched" "OK"
-
-    @{ StartedAt = [datetime]::Now.ToString('o'); StartedHelpers = ($started -join ',') } |
-        ConvertTo-Json | Set-Content $FlagFile
-    Write-Log "Flag written: $FlagFile"
-
-    $note = if ($started.Count) { " + $($started -join ', ')" } else { "" }
-    Send-Toast "Sideloadly" "iPhone connected - daemon started$note."
 
 # ── CASE 2: phone still here, daemon already up → nothing to do
 } elseif ($phoneHere -and $daemonRunning) {
